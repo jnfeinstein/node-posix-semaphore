@@ -1,0 +1,38 @@
+{
+  "name": "node-posix-semaphore",
+  "description": "Native NodeJS wrapper for posix semaphores",
+  "version": "0.0.1",
+  "author": {
+    "name": "Joel Feinstein"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/jnfeinstein/node-posix-semaphore.git"
+  },
+  "bugs": {
+    "url": "http://github.com/jnfeinstein/node-posix-semaphore/issues"
+  },
+  "main": "build/Release/semaphore.node",
+  "scripts": {
+    "test": "nodeunit test"
+  },
+  "engines": {
+    "node": ">= 0.8.0"
+  },
+  "keywords": [
+    "shm",
+    "ipc",
+    "process",
+    "thread",
+    "child",
+    "cluster",
+    "semaphore",
+    "mutex"
+  ],
+  "devDependencies": {
+    "nodeunit": "*"
+  },
+  "readmeFilename": "README.md",
+  "_id": "node-posix-semaphore@0.0.1",
+  "_from": "node-posix-semaphore@"
+}
