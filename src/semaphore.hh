@@ -15,14 +15,19 @@ class Semaphore : public node::ObjectWrap {
   sem_t *sem_;
   char *name_;
 
+  int numSemaphores_;
+
   bool waitAsyncRunning_;
   uv_async_t waitAsyncWatcher_;
   pthread_t waitAsyncThread_;
   v8::Persistent<v8::Function> waitAsyncCallback_;
 
   int Wait(void);
+  int Post(void);
+  int Close(void);
+
   void WaitAsyncCleanup(void);
-  void WaitAsyncCancel(void);
+  void WaitAsyncThreadCleanup(void);
   void WaitAsyncCallbackRun (v8::Handle<v8::Value> result);
 
   static void WaitAsyncCallback (uv_async_t *watcher, int revents);
@@ -35,7 +40,9 @@ class Semaphore : public node::ObjectWrap {
   static v8::Handle<v8::Value> WaitSync(const v8::Arguments& args);
   static v8::Handle<v8::Value> TryWait(const v8::Arguments& args);
   static v8::Handle<v8::Value> Post(const v8::Arguments& args);
+  static v8::Handle<v8::Value> Increment(const v8::Arguments& args);
   static v8::Handle<v8::Value> Name(const v8::Arguments& args);
+  static v8::Handle<v8::Value> Count(const v8::Arguments& args);
   static v8::Persistent<v8::Function> constructor;
 };
 

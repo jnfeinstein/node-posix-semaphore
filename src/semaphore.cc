@@ -14,18 +14,47 @@ using namespace v8;
 Persistent<Function> Semaphore::constructor;
 
 Semaphore::Semaphore(char *name) {
+  // Copy in the name
   name_ = (char *)calloc(sizeof(char), strlen(name));
   strcpy(name_, name);
 
+  // Init async wait variables
   uv_async_init(uv_default_loop(), &waitAsyncWatcher_, Semaphore::WaitAsyncCallback);
   waitAsyncWatcher_.data = this;
   waitAsyncRunning_ = false;
+
+  // No semaphores are held
+  numSemaphores_ = 0;
 }
 
 Semaphore::~Semaphore() {
+  // Clean up name
   free(name_);
-  if (waitAsyncRunning_)
-    WaitAsyncCleanup();
+
+  // Cancel any callbacks
+  WaitAsyncCleanup();
+
+  // Cleanup libuv
+  uv_close((uv_handle_t*) &waitAsyncWatcher_, NULL);
+
+  // Get rid of any held semaphores
+  while(numSemaphores_ > 0)
+    Post();
+
+  // Buh-bye!
+  Close();
+}
+
+int Semaphore::Wait() {
+  return sem_wait(sem_);
+}
+
+int Semaphore::Post() {
+  return sem_post(sem_);
+}
+
+int Semaphore::Close() {
+  return sem_close(sem_);
 }
 
 void Semaphore::Init(Handle<Object> exports, Handle<Object> module) {
@@ -40,7 +69,9 @@ void Semaphore::Init(Handle<Object> exports, Handle<Object> module) {
   NODE_SET_PROTOTYPE_METHOD(tpl, "waitSync", WaitSync);
   NODE_SET_PROTOTYPE_METHOD(tpl, "tryWait", TryWait);
   NODE_SET_PROTOTYPE_METHOD(tpl, "post", Post);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "increment", Increment);
   NODE_SET_PROTOTYPE_METHOD(tpl, "name", Name);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "count", Count);
   constructor = Persistent<Function>::New(tpl->GetFunction());
 
   module->Set(String::NewSymbol("exports"), constructor);
@@ -80,9 +111,10 @@ Handle<Value> Semaphore::Unlink(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  if (sem_unlink(obj->name_) < 0) {
+
+  if (sem_unlink(obj->name_) < 0)
     return ThrowException(node::ErrnoException(errno, "Semaphore::Unlink", ""));
-  }
+
   return Undefined();
 }
 
@@ -90,20 +122,26 @@ Handle<Value> Semaphore::Close(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  if (sem_close(obj->sem_) < 0) {
-    return ThrowException(Exception::Error(String::New("Semaphore::Close -> Failed")));
-  }
-  return Undefined();
-}
 
-int Semaphore::Wait() {
-  return sem_wait(sem_);
+  if (obj->Close() < 0)
+    return ThrowException(node::ErrnoException(errno, "Semaphore::Close", ""));
+
+  return Undefined();
 }
 
 void Semaphore::WaitAsyncCleanup() {
   waitAsyncCallback_.Dispose();
   waitAsyncCallback_.Clear();
-  waitAsyncRunning_ = false;
+  WaitAsyncThreadCleanup();
+}
+
+void Semaphore::WaitAsyncThreadCleanup() {
+  if (waitAsyncRunning_) {
+    pthread_cancel(waitAsyncThread_);
+    pthread_kill(waitAsyncThread_, SIGSEGV);
+    pthread_join(waitAsyncThread_, NULL);
+    waitAsyncRunning_ = false;
+  }
 }
 
 void Semaphore::WaitAsyncCallbackRun(Handle<Value> result) {
@@ -117,14 +155,19 @@ void Semaphore::WaitAsyncCallbackRun(Handle<Value> result) {
 
 void Semaphore::WaitAsyncCallback (uv_async_t *watcher, int revents) {
   HandleScope scope;
+
   Semaphore* obj = (Semaphore *)watcher->data;
+
+  obj->numSemaphores_++;
   obj->WaitAsyncCallbackRun(True());
 }
 
 void* Semaphore::WaitAsyncThread(void *arg) {
   Semaphore* obj = (Semaphore *)arg;
+
   obj->Wait();
   uv_async_send(&obj->waitAsyncWatcher_);
+
   return obj;
 }
 
@@ -132,41 +175,41 @@ Handle<Value> Semaphore::WaitAsyncStart(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+
   if (args.Length() < 1 || !args[0]->IsFunction())
     return ThrowException(Exception::SyntaxError(String::New("Semaphore::Wait -> Requires a function callback")));
   if (obj->waitAsyncRunning_)
     return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Wait already in progress")));
+
   obj->waitAsyncRunning_ = true;
   obj->waitAsyncCallback_ = Persistent<Function>::New(Local<Function>::Cast(args[0]));
   // Use a pthread since libuv doesn't guarantee that uv_thread is pthread, and we need pthread_cancel/kill
   pthread_create (&obj->waitAsyncThread_, NULL, Semaphore::WaitAsyncThread, obj);
-  return args.This();
-}
 
-void Semaphore::WaitAsyncCancel() {
-  if (waitAsyncRunning_) {
-    pthread_cancel(waitAsyncThread_);
-    pthread_kill(waitAsyncThread_, SIGINT);
-    pthread_join(waitAsyncThread_, NULL);
-    WaitAsyncCallbackRun(False());
-  }
+  return Undefined();
 }
 
 Handle<Value> Semaphore::WaitAsyncCancel(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  obj->WaitAsyncCancel();
-  return args.This();
+
+  if (obj->waitAsyncRunning_)
+    obj->WaitAsyncCallbackRun(False());
+
+  return Undefined();
 }
 
 Handle<Value> Semaphore::WaitSync(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  if (obj->Wait() < 0) {
+
+  if (obj->Wait() < 0)
     return ThrowException(node::ErrnoException(errno, "Semaphore::WaitSync", ""));
-  }
+
+  obj->numSemaphores_++;
+
   return True();
 }
 
@@ -174,12 +217,16 @@ Handle<Value> Semaphore::TryWait(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+
   if (sem_trywait(obj->sem_) < 0) {
     if (errno == EAGAIN)
       return False();
     else
       return ThrowException(node::ErrnoException(errno, "Semaphore::TryWait", ""));
   }
+
+  obj->numSemaphores_++;
+
   return True();
 }
 
@@ -187,9 +234,26 @@ Handle<Value> Semaphore::Post(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  if (sem_post(obj->sem_) < 0) {
+
+  if (obj->numSemaphores_ <= 0)
+    return False();
+
+  if (obj->Post() < 0)
     return ThrowException(node::ErrnoException(errno, "Semaphore::Post", ""));
-  }
+
+  obj->numSemaphores_--;
+
+  return True();
+}
+
+Handle<Value> Semaphore::Increment(const Arguments& args) {
+  HandleScope scope;
+
+  Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+
+  if (obj->Post() < 0)
+    return ThrowException(node::ErrnoException(errno, "Semaphore::Increment", ""));
+
   return True();
 }
 
@@ -197,7 +261,16 @@ Handle<Value> Semaphore::Name(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+
   return scope.Close(String::New(obj->name_));
+}
+
+Handle<Value> Semaphore::Count(const Arguments& args) {
+  HandleScope scope;
+
+  Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+
+  return scope.Close(Integer::New(obj->numSemaphores_));
 }
 
 NODE_MODULE(semaphore, Semaphore::Init)
