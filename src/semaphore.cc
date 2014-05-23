@@ -4,6 +4,8 @@
 
 #include <errno.h>
 #include <string.h>
+#include <uv.h>
+#include <pthread.h>
 #include <node.h>
 #include "semaphore.hh"
 
@@ -14,10 +16,16 @@ Persistent<Function> Semaphore::constructor;
 Semaphore::Semaphore(char *name) {
   name_ = (char *)calloc(sizeof(char), strlen(name));
   strcpy(name_, name);
+
+  uv_async_init(uv_default_loop(), &waitAsyncWatcher_, Semaphore::WaitAsyncCallback);
+  waitAsyncWatcher_.data = this;
+  waitAsyncRunning_ = false;
 }
 
 Semaphore::~Semaphore() {
   free(name_);
+  if (waitAsyncRunning_)
+    WaitAsyncCleanup();
 }
 
 void Semaphore::Init(Handle<Object> exports, Handle<Object> module) {
@@ -27,8 +35,10 @@ void Semaphore::Init(Handle<Object> exports, Handle<Object> module) {
   tpl->InstanceTemplate()->SetInternalFieldCount(1);
   NODE_SET_PROTOTYPE_METHOD(tpl, "unlink", Unlink);
   NODE_SET_PROTOTYPE_METHOD(tpl, "close", Close);
-  NODE_SET_PROTOTYPE_METHOD(tpl, "wait", Wait);
-  NODE_SET_PROTOTYPE_METHOD(tpl, "trywait", TryWait);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "wait", WaitAsyncStart);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "waitCancel", WaitAsyncCancel);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "waitSync", WaitSync);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "tryWait", TryWait);
   NODE_SET_PROTOTYPE_METHOD(tpl, "post", Post);
   NODE_SET_PROTOTYPE_METHOD(tpl, "name", Name);
   constructor = Persistent<Function>::New(tpl->GetFunction());
@@ -71,16 +81,9 @@ Handle<Value> Semaphore::Unlink(const Arguments& args) {
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
   if (sem_unlink(obj->name_) < 0) {
-    switch errno {
-      case EACCES:
-        return ThrowException(Exception::Error(String::New("Semaphore::Unlink -> Insufficient permissions")));
-      case ENOENT:
-        return ThrowException(Exception::Error(String::New("Semaphore::Unlink -> Semaphore does not exist")));
-      default:
-        return ThrowException(Exception::Error(String::New("Semaphore::Unlink -> Failed")));
-    }
+    return ThrowException(node::ErrnoException(errno, "Semaphore::Unlink", ""));
   }
-  return scope.Close(Undefined());
+  return Undefined();
 }
 
 Handle<Value> Semaphore::Close(const Arguments& args) {
@@ -90,27 +93,81 @@ Handle<Value> Semaphore::Close(const Arguments& args) {
   if (sem_close(obj->sem_) < 0) {
     return ThrowException(Exception::Error(String::New("Semaphore::Close -> Failed")));
   }
-
-  return scope.Close(Undefined());
+  return Undefined();
 }
 
-Handle<Value> Semaphore::Wait(const Arguments& args) {
+int Semaphore::Wait() {
+  return sem_wait(sem_);
+}
+
+void Semaphore::WaitAsyncCleanup() {
+  waitAsyncCallback_.Dispose();
+  waitAsyncCallback_.Clear();
+  waitAsyncRunning_ = false;
+}
+
+void Semaphore::WaitAsyncCallbackRun(Handle<Value> result) {
+  HandleScope scope;
+  // Stash locally so that the persistent handle can be disposed safely
+  Local<Function> callback = Local<Function>::New(waitAsyncCallback_);
+  WaitAsyncCleanup();
+  Handle<Value> args[1] = { result };
+  callback->Call(handle_, 1, args);
+}
+
+void Semaphore::WaitAsyncCallback (uv_async_t *watcher, int revents) {
+  HandleScope scope;
+  Semaphore* obj = (Semaphore *)watcher->data;
+  obj->WaitAsyncCallbackRun(True());
+}
+
+void* Semaphore::WaitAsyncThread(void *arg) {
+  Semaphore* obj = (Semaphore *)arg;
+  obj->Wait();
+  uv_async_send(&obj->waitAsyncWatcher_);
+  return obj;
+}
+
+Handle<Value> Semaphore::WaitAsyncStart(const Arguments& args) {
   HandleScope scope;
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
-  if (sem_wait(obj->sem_) < 0) {
-    switch(errno) {
-      case EDEADLK:
-        return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Deadlock detected")));
-      case EINTR:
-        return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Interrupted by system signal")));
-      case EINVAL:
-        return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Semaphore does not exist")));
-      default:
-        return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Failed")));
-    }
+  if (args.Length() < 1 || !args[0]->IsFunction())
+    return ThrowException(Exception::SyntaxError(String::New("Semaphore::Wait -> Requires a function callback")));
+  if (obj->waitAsyncRunning_)
+    return ThrowException(Exception::Error(String::New("Semaphore::Wait -> Wait already in progress")));
+  obj->waitAsyncRunning_ = true;
+  obj->waitAsyncCallback_ = Persistent<Function>::New(Local<Function>::Cast(args[0]));
+  // Use a pthread since libuv doesn't guarantee that uv_thread is pthread, and we need pthread_cancel/kill
+  pthread_create (&obj->waitAsyncThread_, NULL, Semaphore::WaitAsyncThread, obj);
+  return args.This();
+}
+
+void Semaphore::WaitAsyncCancel() {
+  if (waitAsyncRunning_) {
+    pthread_cancel(waitAsyncThread_);
+    pthread_kill(waitAsyncThread_, SIGINT);
+    pthread_join(waitAsyncThread_, NULL);
+    WaitAsyncCallbackRun(False());
   }
-  return scope.Close(Boolean::New(true));
+}
+
+Handle<Value> Semaphore::WaitAsyncCancel(const Arguments& args) {
+  HandleScope scope;
+
+  Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+  obj->WaitAsyncCancel();
+  return args.This();
+}
+
+Handle<Value> Semaphore::WaitSync(const Arguments& args) {
+  HandleScope scope;
+
+  Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
+  if (obj->Wait() < 0) {
+    return ThrowException(node::ErrnoException(errno, "Semaphore::WaitSync", ""));
+  }
+  return True();
 }
 
 Handle<Value> Semaphore::TryWait(const Arguments& args) {
@@ -118,20 +175,12 @@ Handle<Value> Semaphore::TryWait(const Arguments& args) {
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
   if (sem_trywait(obj->sem_) < 0) {
-    switch(errno) {
-      case EAGAIN:
-        return scope.Close(Boolean::New(false));
-      case EDEADLK:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Deadlock detected")));
-      case EINTR:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Interrupted by system signal")));
-      case EINVAL:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Semaphore does not exist")));
-      default:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Failed")));
-    }
+    if (errno == EAGAIN)
+      return False();
+    else
+      return ThrowException(node::ErrnoException(errno, "Semaphore::TryWait", ""));
   }
-  return scope.Close(Boolean::New(true));
+  return True();
 }
 
 Handle<Value> Semaphore::Post(const Arguments& args) {
@@ -139,14 +188,9 @@ Handle<Value> Semaphore::Post(const Arguments& args) {
 
   Semaphore* obj = ObjectWrap::Unwrap<Semaphore>(args.This());
   if (sem_post(obj->sem_) < 0) {
-    switch(errno) {
-      case EINVAL:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Semaphore does not exist")));
-      default:
-        return ThrowException(Exception::Error(String::New("Semaphore::TryWait -> Failed")));
-    }
+    return ThrowException(node::ErrnoException(errno, "Semaphore::Post", ""));
   }
-  return scope.Close(Boolean::New(true));
+  return True();
 }
 
 Handle<Value> Semaphore::Name(const Arguments& args) {
